@@ -7,6 +7,7 @@ const {
 const token = process.env.DISCORD_TOKEN;
 let targetChannelId = process.env.TARGET_CHANNEL_ID || null;
 const guildId = process.env.GUILD_ID;
+const configuredClientId = process.env.CLIENT_ID;
 const intervalSeconds = Math.max(15, Number.parseInt(process.env.STATUS_INTERVAL_SECONDS || '30', 10) || 30);
 if (!token) { console.error('Missing DISCORD_TOKEN.'); process.exit(1); }
 
@@ -15,20 +16,34 @@ const statuses = [
   { name: 'Monitoring 2340 members', type: ActivityType.Watching },
 ];
 
-const HINGLISH_WORDS = new Set([
-  'hai','hain','hoon','hu','hun','tha','thi','the','nahi','nhi','nahin','haan','han','kya','kyu','kyun','kaise','kaisa','kaisi','kab','kahan','kidhar','kaun','kon','mera','meri','mere','tera','teri','tere','tum','tumhara','tumhari','aap','apka','apni','apne','mujhe','mujhko','tujhe','isko','usko','hum','ham','hamara','apna','unka','unki','kar','karo','kare','karen','kardo','krdo','kr','krna','karna','karke','bata','batao','batado','bol','bolo','bola','bolna','de','do','dedo','le','lelo','liye','chahiye','chahie','matlab','bhai','yaar','acha','accha','achha','abhi','phir','fir','kyunki','toh','to','aur','par','lekin','magar','bas','bohot','bahut','thoda','zyada','wala','wali','wale','sab','kuch','koi','mat','raha','rahi','rahe','gaya','gayi','gaye','jao','jana','aana','aa','gya','gyi','scene','pata','padh','dekh','dekho','sun','suno','samajh','samjha','samjho','milega','mila','milta','milti','krde','bta','btao','mtlb','kese','konsa','konsi','kitna','kitni','kitne','ab','kal','aaj'
-]);
-const STRONG_HINGLISH = new Set(['mujhe','tumhe','tujhe','bhai','yaar','kardo','krdo','batao','batado','nahi','nhi','hain','hoon','kaise','kyun','kyu','kya','tera','meri','matlab','raha','rahi','rahe','chahiye','btao','krna','karna']);
+const fs = require('node:fs');
+const path = require('node:path');
+const slangFile = path.join(__dirname, 'hinglish-slangs.json');
+let HINGLISH_SLANGS = [];
+try {
+  HINGLISH_SLANGS = JSON.parse(fs.readFileSync(slangFile, 'utf8'))
+    .filter(item => typeof item === 'string' && item.trim())
+    .map(item => item.toLowerCase().trim());
+  console.log(`Loaded ${HINGLISH_SLANGS.length} Hinglish slang patterns from hinglish-slangs.json`);
+} catch (error) {
+  console.error('Could not load hinglish-slangs.json:', error.message);
+  process.exit(1);
+}
 function normalizeMessage(content) {
   return content.toLowerCase().replace(/https?:\/\/\S+/g, ' ').replace(/<@!?\d+>|<@&\d+>|<#\d+>/g, ' ').replace(/[^a-z\s']/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 function detectHinglish(content) {
   const normalized = normalizeMessage(content);
   if (!normalized) return { detected: false, matches: [] };
-  const words = normalized.split(' ');
-  const matches = [...new Set(words.filter(word => HINGLISH_WORDS.has(word)))];
-  const strongMatches = matches.filter(word => STRONG_HINGLISH.has(word));
-  return { detected: strongMatches.length >= 2 || (strongMatches.length >= 1 && matches.length >= 2) || matches.length >= 3, matches };
+  // Strict mode: a single word/phrase from the editable list is enough to trigger moderation.
+  const matches = HINGLISH_SLANGS.filter(pattern => {
+    const regex = new RegExp(`(?:^|\\s)${escapeRegex(pattern).replace(/\\ /g, '\\s+')}(?=$|\\s)`, 'i');
+    return regex.test(normalized);
+  });
+  return { detected: matches.length > 0, matches: [...new Set(matches)] };
 }
 function warningEmbed(reason = 'Your message was removed because it appears to contain Hinglish or Roman Hindi.') {
   return new EmbedBuilder().setColor(0xe67e22).setTitle('Language Warning')
@@ -75,14 +90,22 @@ const commandData = [
 async function registerCommands() {
   try {
     const rest = new REST({ version: '10' }).setToken(token);
+    const applicationId = configuredClientId || client.user.id;
+    if (!/^\d{17,20}$/.test(applicationId)) throw new Error('CLIENT_ID is invalid. Set it to the Application ID from Discord Developer Portal.');
     if (guildId && /^\d{17,20}$/.test(guildId)) {
-      await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commandData });
-      console.log(`Registered guild slash commands in ${guildId}.`);
+      const registered = await rest.put(Routes.applicationGuildCommands(applicationId, guildId), { body: commandData });
+      console.log(`SUCCESS: Registered ${registered.length} guild slash commands in server ${guildId}: ${registered.map(c => '/' + c.name).join(', ')}`);
     } else {
-      await rest.put(Routes.applicationCommands(client.user.id), { body: commandData });
-      console.log('Registered global slash commands (may take time to appear).');
+      const registered = await rest.put(Routes.applicationCommands(applicationId), { body: commandData });
+      console.log(`SUCCESS: Registered ${registered.length} GLOBAL slash commands: ${registered.map(c => '/' + c.name).join(', ')}. Global commands can take time to appear.`);
     }
-  } catch (error) { console.error('Slash command registration failed:', error.message); }
+  } catch (error) {
+    console.error('SLASH COMMAND REGISTRATION FAILED');
+    console.error('Message:', error.message);
+    console.error('Discord API code:', error.code || 'unknown');
+    console.error('HTTP status:', error.status || 'unknown');
+    console.error('Set CLIENT_ID to the Application ID matching DISCORD_TOKEN, and verify GUILD_ID.');
+  }
 }
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
@@ -109,10 +132,10 @@ client.on('interactionCreate', async interaction => {
     const embed = new EmbedBuilder().setColor(0xe74c3c).setTitle('Language Guard Status').addFields(
       { name: 'Moderation channel', value: targetChannelId ? `<#${targetChannelId}>` : 'Not set — use `/set-channel`', inline: true },
       { name: 'Warning delivery', value: 'Same channel with a user ping', inline: true },
-      { name: 'Detection', value: 'Roman-Hindi/Hinglish word heuristic', inline: false },
+      { name: 'Detection', value: `Strict list match: ${HINGLISH_SLANGS.length} Hinglish patterns; any one match triggers deletion` , inline: false },
       { name: 'Commands', value: '`/languageguard`, `/set-channel`, `/refresh`, `/manual-detection`', inline: false },
       { name: 'Rotating presence', value: 'Securing server /marvelboost\nMonitoring 2340 members', inline: false },
-    ).setFooter({ text: 'Detection is heuristic and can occasionally be incorrect.' });
+    ).setFooter({ text: 'Any one matching list item triggers deletion. False positives are possible; edit hinglish-slangs.json to tune the list.' });
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
   if (!targetChannelId) {
